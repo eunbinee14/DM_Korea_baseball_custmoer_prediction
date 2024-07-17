@@ -1,0 +1,118 @@
+# 기본 조건
+# -*- coding: utf-8 -*-
+
+!pip install transformers
+!pip install sentence_transformers
+!pip install konlpy
+
+from transformers import PreTrainedTokenizerFast, BartForConditionalGeneration
+
+import numpy as np
+import pandas as pd
+import re
+import matplotlib.pyplot as plt
+import itertools
+
+from konlpy.tag import Okt
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+
+
+from nltk.corpus import stopwords
+from bs4 import BeautifulSoup
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import urllib.request
+from google.colab import drive
+
+
+# 빅카인즈 기사 유사도 분석 및 키워드 분석 
+tokenizer = PreTrainedTokenizerFast.from_pretrained("EbanLee/kobart-summary-v3")
+model = BartForConditionalGeneration.from_pretrained("EbanLee/kobart-summary-v3")
+
+
+def max_sum_sim(doc_embedding, candidate_embeddings, words, top_n, nr_candidates):
+    # 문서와 각 키워드들 간의 유사도
+    distances = cosine_similarity(doc_embedding, candidate_embeddings)
+
+    # 각 키워드들 간의 유사도
+    distances_candidates = cosine_similarity(candidate_embeddings,
+                                            candidate_embeddings)
+
+    # 코사인 유사도에 기반하여 키워드들 중 상위 top_n개의 단어를 pick.
+    words_idx = list(distances.argsort()[0][-nr_candidates:])
+    words_vals = [candidates[index] for index in words_idx]
+    distances_candidates = distances_candidates[np.ix_(words_idx, words_idx)]
+
+    # 각 키워드들 중에서 가장 덜 유사한 키워드들간의 조합을 계산
+    min_sim = np.inf
+    candidate = None
+    for combination in itertools.combinations(range(len(words_idx)), top_n):
+        sim = sum([distances_candidates[i][j] for i in combination for j in combination if i != j])
+        if sim < min_sim:
+            candidate = combination
+            min_sim = sim
+
+    return [words_vals[idx] for idx in candidate]
+
+# 파일 불러오기 / 15년부터 24년까지 
+data = pd.read_csv("/content/NewsResult_20210403-20211030.csv", nrows=100000, encoding='cp949')
+
+# '분석제외 여부' 칼럼이 null인 행만 추출
+data = data[data['분석제외 여부'].isna()]
+
+# 필요한 컬럼만 추출
+data = data[['title_kor', 'summary', 'keys_kor']]
+
+data = data.drop_duplicates()
+
+for i in range(len(data)):
+    print(i + 1, end='번째 요약문')
+
+    news_text = data['summary'].iloc[i]
+    if pd.isna(news_text):
+        print("키워드 분석을 할 수 없는 내용입니다")
+        print("--------------------------------------------------\n")
+    else:
+        input_ids = tokenizer(news_text, return_tensors="pt", padding="max_length", truncation=True, max_length=1026)
+        summary_text_ids = model.generate(
+            input_ids=input_ids['input_ids'],
+            attention_mask=input_ids['attention_mask'],
+            bos_token_id=model.config.bos_token_id,
+            eos_token_id=model.config.eos_token_id,
+            length_penalty=2.0,
+            max_length=200,
+            min_length=10,
+            num_beams=4,
+        )
+
+        doc = tokenizer.decode(summary_text_ids[0], skip_special_tokens=True)
+        #print(doc)
+
+        try:
+            # 여기서부터 키워드 도출
+            okt = Okt()
+
+            tokenized_doc = okt.pos(news_text)
+            tokenized_nouns = ' '.join([word[0] for word in tokenized_doc if word[1] == 'Noun'])
+
+            n_gram_range = (2, 3)
+
+            count = CountVectorizer(ngram_range=n_gram_range).fit([tokenized_nouns])
+            candidates = count.get_feature_names_out()
+
+            model_keyword = SentenceTransformer('sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens')
+            doc_embedding = model_keyword.encode([doc])
+            candidate_embeddings = model_keyword.encode(candidates)
+            top_n = 5
+            distances = cosine_similarity(doc_embedding, candidate_embeddings)
+            keywords = [candidates[index] for index in distances.argsort()[0][-top_n:]]
+
+            print("Max Sum Candidate 방식 키워드 추출\n", end='')
+            print(max_sum_sim(doc_embedding, candidate_embeddings, candidates, top_n=5, nr_candidates=30))
+        except Exception as e:
+            print("키워드 분석을 할 수 없는 내용입니다")
+            print(f"에러 내용: {e}")
+
+        print("--------------------------------------------------\n")
